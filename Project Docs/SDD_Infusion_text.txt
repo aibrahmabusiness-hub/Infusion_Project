@@ -1,0 +1,220 @@
+We are building a Controlled Substance Infusion Discrepancy Detection Solution that reconciles medication activity across three source files to identify discrepancies between medication dispensed, administered, and wasted. The objective is to automate a reconciliation process currently performed manually by Pharmacy and surface potential documentation errors, workflow gaps, or diversion risks for review.
+This solution supports controlled-substance infusion reconciliation and therefore must prioritize accuracy and auditability. False positives are acceptable. False negatives are not. Any ambiguous records should be surfaced as exceptions for Pharmacy review rather than automatically reconciled.
+Business Objective
+Determine whether the amount of medication dispensed from Pyxis reconciles with the amount administered to the patient and the amount documented as waste.
+For each Order ID:
+Expected Waste = Total Dispensed Amount − Total Administered Amount
+Variance = Expected Waste − Documented Waste
+Any material variance should be surfaced as an exception for Pharmacy review.
+Source File 1: Pyxis Audit Transaction Detail
+This report runs weekly and contains one week's worth of Pyxis transaction activity.
+The primary purpose of this file is to determine the amount of controlled substance dispensed and wasted for each infusion order.
+Key Fields
+Order Number
+Transaction Type
+Transaction Date Time (Column E)
+MedDescription
+Quantity (Column AR)
+Transaction Types
+Include:
+Vend
+Waste
+Ignore:
+Stock Return
+Vend (Cancel)
+Vend/Waste Matching Logic
+For each Order Number, we need to calculate the amount of medication dispensed and wasted.
+However, Order Number alone cannot be used because a single infusion treatment may span multiple medication bags while remaining under the same Order Number.
+As a result:
+One Order Number may contain multiple Vend transactions.
+One Order Number may contain multiple Waste transactions.
+Each Vend should be paired with the corresponding Waste for the same medication bag.
+The primary matching criteria are:
+Order Number
+Medication Description
+Closest Transaction Date/Time
+Example:
+Vend: 6/13 at 13:04
+Waste: 6/13 at 13:11
+These records should be paired together because they represent the same medication bag.
+If additional Waste records exist on:
+6/9
+6/11
+they should not be paired with the 6/13 Vend and instead should be treated as separate medication bag events.
+Medication Amount Calculation
+The MedDescription field contains medication concentration and volume information that must be parsed.
+Example:
+Ketamine in NS 5 mg/1mL (50mL)
+Available medication should be calculated as:
+5 mg × 50 mL = 250 mg available
+The solution should automatically calculate the total medication available using the concentration and volume information contained within MedDescription.
+The documented waste amount is found in Quantity (Column AR).
+Source File 2: Epic Medication Administrations
+This report runs on the same weekly schedule and provides administration context required to correctly interpret infusion activity documented in Epic.
+This report is primarily used to determine how medication administration should be interpreted (New Bag, Given, Bolus, etc.) and to determine whether unit conversion is required.
+Key Fields
+MRN (Column A)
+Patient Name (Column B)
+Order ID (Column C)
+Medication (Column E)
+Administrative Action (Column F)
+Matching Logic
+Order ID alone is not sufficient for matching records between Epic and Pyxis.
+To ensure accurate reconciliation, records should be matched using:
+MRN
+Patient Name
+Order ID
+Medication
+All four fields should align between systems before records are considered a valid match.
+Any records that cannot be confidently matched should be surfaced as exceptions.
+Administrative Action Logic
+Observed values include:
+New Bag
+Given
+Bolus
+New Syringe
+Restarted
+Stopped
+New Bag
+Valid administration event.
+No conversion required.
+Reconcile using mL.
+Given
+Treated identically to New Bag.
+No conversion required.
+Reconcile using mL.
+New Syringe
+Valid administration event.
+No conversion required.
+Reconcile using mL.
+Multiple New Syringe events may exist under the same Order ID.
+Bolus
+Requires unit conversion.
+Flowsheet values must be converted from mL to mg using the medication concentration extracted from the Pyxis MedDescription field.
+Reconcile using mg.
+Restarted
+Surface as an exception.
+Do not automatically reconcile.
+Stopped
+Surface as an exception.
+Do not automatically reconcile.
+Exception Rule
+Any Order ID containing one or more Stopped or Restarted actions should be flagged for manual Pharmacy review because these actions may indicate interrupted infusion workflows.
+Source File 3: Epic Flowsheet Med Infusion Volume
+This report runs on the same weekly schedule and contains the actual infusion volumes documented within Epic.
+Unlike the Medication Administration report, this file is the primary source of truth for medication administered to the patient.
+Key Fields
+MRN (Column B)
+Patient Name (Column C)
+Order ID (Column D)
+Flowsheet Row Name (Column E)
+Recorded Time (Column G)
+Value / Infusion Amount (Column H)
+Matching Logic
+Records should be matched to Pyxis and Epic Medication Administration records using:
+MRN
+Patient Name
+Order ID
+Medication
+A challenge with this report is that Flowsheet Row Name will not always exactly match the medication description found in Pyxis.
+Example:
+Pyxis:
+Ketamine in NS 5 mg/1mL (50mL)
+Flowsheet:
+Ketamine Infusion Volume
+Ketamine Administration
+Because naming conventions differ between systems, the solution should leverage AI/LLM-assisted matching to determine whether the Flowsheet Row Name represents the same medication documented within Pyxis and Epic Medication Administration records.
+The AI matching should consider:
+Medication name
+Drug concentration
+Common abbreviations
+Infusion naming conventions
+Similarity to the Medication field in the Epic Medication Administration report
+If confidence falls below a defined threshold, the record should be surfaced as an exception rather than automatically matched.
+Administration Volume Logic
+The actual infused amount is found in:
+Column H
+All values in this report are documented in mL.
+A single Order ID will frequently contain multiple infusion volume entries.
+Example:
+Order ID
+Recorded Time
+Volume
+12345
+6/13 13:15
+10 mL
+12345
+6/13 14:30
+15 mL
+12345
+6/13 15:45
+20 mL
+These records should not be treated independently.
+Instead:
+Total Administered Volume =SUM(All Column H Values for the Order ID)
+Unit Conversion Logic
+The Epic Medication Administration report determines whether conversion is required.
+If Administrative Action is:
+New Bag → Keep values in mL
+Given → Keep values in mL
+New Syringe → Keep values in mL
+If Administrative Action is:
+Bolus → Convert values from mL to mg using the concentration extracted from Pyxis
+Example:
+Pyxis MedDescription:Ketamine in NS 5 mg/1mL (50mL)
+Flowsheet Total:20 mL
+Converted Amount:20 × 5 = 100 mg
+Only Bolus-related Order IDs should undergo conversion.
+All other administration types should remain in mL.
+Date Matching Logic
+Recorded Time (Column G) should be used to validate alignment with Pyxis transaction activity.
+Exact timestamp matching should not be required because infusions can span multiple days.
+Recorded Time should instead be used to:
+Validate the infusion occurred within the active Order ID lifecycle
+Associate administration activity with the appropriate dispense events
+Support cross-week order tracking
+Reconciliation Logic
+For each Order ID:
+Calculate:
+Total Dispensed Amount =SUM(All Vend Amounts)
+Total Waste Amount =SUM(All Waste Amounts)
+Total Administered Amount =SUM(All Flowsheet Values for the Order ID)
+Unit handling should be based on Administrative Action:
+If Administrative Action = Bolus:
+Convert administered values to mg before reconciliation.
+If Administrative Action = New Bag, Given, or New Syringe:
+Leave administered values in mL.
+The solution should never mix units within the same reconciliation calculation.
+Expected Waste =Total Dispensed Amount − Total Administered Amount
+Variance =Expected Waste − Documented Waste
+Any material variance should be surfaced as an exception.
+Cross-Week Order Tracking
+A critical consideration is that infusion orders can remain active for up to 96 hours and may span multiple reporting periods.
+Example:
+Week 1:
+Dispensed = 500
+Administered = 300
+This appears to leave a discrepancy of 200.
+However, if the same Order ID continues into Week 2:
+Week 2:
+Administered = 180
+Waste = 20
+Final reconciliation:
+500 − 480 − 20 = 0
+No discrepancy exists.
+Therefore, the solution must maintain historical tracking of active Order IDs and continue accumulating dispensed, administered, and wasted amounts until the order is complete or reaches the 96-hour maximum hang time.
+Exception Handling
+Generate exceptions for:
+Missing waste documentation
+Excess waste documentation
+Missing administration activity
+Missing Pyxis activity
+Missing concentration data for Bolus conversions
+Ambiguous Vend/Waste matching
+Ambiguous medication matching
+Stopped actions
+Restarted actions
+Records that cannot be confidently matched across systems
+Orders that remain unresolved after the maximum hang time
+Any AI/LLM medication match below the confidence threshold
+The final output should be an exception report that allows Pharmacy to quickly investigate documentation errors, workflow issues, and potential diversion risks.
